@@ -1,0 +1,214 @@
+name: Daily Runs
+
+# ---------------------------------------------------------------------------
+# Deployment target: GitHub Actions on a PUBLIC repository (Architecture.md
+# section 5 / PRD.md constraint 4, changed 2026-09-19 — supersedes the
+# original VM+cron plan). Each run is a fresh, stateless GitHub-hosted
+# runner: there is no persistent disk, so the Instagram session is restored
+# at the start of every run from the IG_SESSION_B64 repository secret (see
+# the "Restore Instagram session" step below) and never committed to the
+# repo.
+#
+# UTC CRON MATH (GitHub Actions `schedule` cron is ALWAYS interpreted as
+# UTC — there is no way to pin a workflow cron to IST directly). IST is a
+# fixed UTC+5:30 offset (no DST), so converting IST -> UTC means
+# SUBTRACTING 5 hours 30 minutes from the IST time:
+#
+#   Run 1 start   = 1:00 PM IST = 13:00 IST - 5:30 = 07:30 UTC -> "30 7  * * *"
+#   Run 2 start   = 5:00 PM IST = 17:00 IST - 5:30 = 11:30 UTC -> "30 11 * * *"
+#   Email report  = 8:00 PM IST = 20:00 IST - 5:30 = 14:30 UTC -> "30 14 * * *"
+#
+# NOTE ON SCHEDULE RELIABILITY: GitHub Actions documents that scheduled
+# (`on: schedule`) workflows run "on the latest commit on the default
+# branch" and are NOT guaranteed to fire at the exact minute requested —
+# under platform load GitHub can delay a scheduled run by anywhere from a
+# few minutes up to roughly an hour. A run firing 15-60 minutes late is
+# EXPECTED PLATFORM BEHAVIOR, not a bug in this workflow or in
+# scheduler_rules.py's window math.
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    - cron: "30 7 * * *"   # Run 1 start  = 1:00 PM IST (07:30 UTC)
+    - cron: "30 11 * * *"  # Run 2 start  = 5:00 PM IST (11:30 UTC)
+    - cron: "30 14 * * *"  # Email report = 8:00 PM IST (14:30 UTC)
+
+  # Lets the manager (or anyone with write access) manually fire any one
+  # step for testing, without waiting for the real schedule. Left at its
+  # default ("auto"), a manual dispatch behaves like a schedule-less test of
+  # run1 (see the "Determine run mode" step's fallback below) rather than
+  # trying to guess a schedule that isn't there.
+  workflow_dispatch:
+    inputs:
+      run_override:
+        description: "Which step to run (leave as 'auto' to let the schedule decide)"
+        required: false
+        type: choice
+        default: auto
+        options:
+          - auto
+          - run1
+          - run2
+          - report
+
+permissions:
+  contents: write  # needed for the last_run.txt bot-identity commit at the end
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      IG_USERNAME: ${{ secrets.IG_USERNAME }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      GMAIL_SENDER_EMAIL: ${{ secrets.GMAIL_SENDER_EMAIL }}
+      GMAIL_RECIPIENT_EMAIL: ${{ secrets.GMAIL_RECIPIENT_EMAIL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # -----------------------------------------------------------------
+      # Decide which of run1 / run2 / report this invocation is for.
+      # A manual workflow_dispatch always carries `run_override`
+      # (default "auto"); a real scheduled trigger carries no dispatch
+      # input at all, so it's classified by matching github.event.schedule
+      # against the three cron strings declared above.
+      # -----------------------------------------------------------------
+      - name: Determine run mode
+        id: mode
+        run: |
+          OVERRIDE="${{ github.event.inputs.run_override }}"
+          if [ -n "$OVERRIDE" ] && [ "$OVERRIDE" != "auto" ]; then
+            MODE="$OVERRIDE"
+          else
+            case "${{ github.event.schedule }}" in
+              "30 7 * * *")  MODE="run1" ;;
+              "30 11 * * *") MODE="run2" ;;
+              "30 14 * * *") MODE="report" ;;
+              *) MODE="run1" ;;  # manual dispatch left on "auto" with no schedule -> default test target
+            esac
+          fi
+          echo "Resolved run mode: $MODE"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # Restore the persisted Instagram session from the IG_SESSION_B64
+      # secret. session_manager.default_session_path() expects
+      # "<IG_SESSION_DIR>/<IG_USERNAME>.session" (IG_SESSION_DIR defaults
+      # to "./session"), so that's exactly the path decoded to here.
+      # Skipped for the report step, which never touches Instagram.
+      # -----------------------------------------------------------------
+      - name: Restore Instagram session
+        if: steps.mode.outputs.mode == 'run1' || steps.mode.outputs.mode == 'run2'
+        run: |
+          mkdir -p session
+          echo "${{ secrets.IG_SESSION_B64 }}" | base64 -d > "session/${IG_USERNAME}.session"
+          ls -la session/
+
+      # -----------------------------------------------------------------
+      # Validate the restored session via session_manager's own real
+      # validation (test_login() after load_session_from_file(), per
+      # session_manager.load_saved_session) rather than re-implementing any
+      # check. On failure: notify Telegram directly through the real
+      # notifier.send_telegram_message() function (not a hand-rolled curl
+      # call to the Bot API), then exit non-zero so the job is marked
+      # failed -- a genuine failure state, not something to swallow.
+      # -----------------------------------------------------------------
+      - name: Validate Instagram session
+        if: steps.mode.outputs.mode == 'run1' || steps.mode.outputs.mode == 'run2'
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import notifier
+          import session_manager
+
+          FAILURE_MESSAGE = (
+              "Instagram session invalid or missing — re-run the local "
+              "one-time login and update the IG_SESSION_B64 secret"
+          )
+
+          def alert_and_exit(exc):
+              print(f"::error::{FAILURE_MESSAGE} (detail: {exc})")
+              token = os.environ.get("TELEGRAM_BOT_TOKEN")
+              chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+              if token and chat_id:
+                  notifier.send_telegram_message(token, chat_id, FAILURE_MESSAGE)
+              else:
+                  print("::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; failure alert not sent.")
+              sys.exit(1)
+
+          try:
+              session_manager.ensure_session()
+              print("Instagram session is valid.")
+          except (
+              session_manager.SessionInvalidError,
+              session_manager.ChallengeRequiredError,
+              session_manager.SessionManagerError,
+          ) as exc:
+              alert_and_exit(exc)
+          except Exception as exc:  # noqa: BLE001 - any other decode/load failure is the same operator action
+              alert_and_exit(exc)
+          PY
+
+      - name: Run orchestrator (research run)
+        if: steps.mode.outputs.mode == 'run1' || steps.mode.outputs.mode == 'run2'
+        run: python orchestrator.py --run ${{ steps.mode.outputs.mode }}
+
+      - name: Run daily email report
+        if: steps.mode.outputs.mode == 'report'
+        run: python orchestrator.py --report
+
+      # -----------------------------------------------------------------
+      # Upload this run's CSV as a workflow artifact (Architecture.md §5:
+      # chosen over committing CSVs to the repo, to keep the public repo's
+      # git history free of scraped business data). `if: always()` so a
+      # failed session-validation step (job already marked failed above)
+      # still gets whatever partial output exists uploaded/attempted rather
+      # than silently skipped; if-no-files-found: ignore covers report runs
+      # (no new CSV) and halted runs (no CSV written at all).
+      # -----------------------------------------------------------------
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leads-csv-${{ github.run_id }}
+          path: output/*.csv
+          if-no-files-found: ignore
+
+      # -----------------------------------------------------------------
+      # Trivial bot-identity commit to keep the repo "active" so GitHub
+      # doesn't auto-disable this scheduled workflow after 60 days of no
+      # repo activity (Architecture.md §5). ONLY last_run.txt — never the
+      # CSV/lead data. `if: always()` is deliberate: even a failed
+      # (session-invalid) run still records that it ran, which is exactly
+      # the repo activity needed to avoid the 60-day disable — see
+      # README.md's "60-day inactivity rule" section for the one scenario
+      # this still doesn't cover (the workflow itself stops running
+      # entirely, e.g. disabled by a human, or GitHub-side outages).
+      # `git diff --quiet || git commit ...` guards against "nothing to
+      # commit" (same mode run twice in one UTC minute) failing the job.
+      # -----------------------------------------------------------------
+      - name: Record last run timestamp
+        if: always()
+        run: |
+          mkdir -p .
+          date -u +"%Y-%m-%dT%H:%M:%SZ mode=${{ steps.mode.outputs.mode }} run_id=${{ github.run_id }}" > last_run.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_run.txt
+          if git diff --cached --quiet; then
+            echo "last_run.txt unchanged; nothing to commit."
+          else
+            git commit -m "chore: update last_run.txt [skip ci]"
+            git push
+          fi

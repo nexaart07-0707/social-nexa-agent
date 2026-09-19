@@ -1,0 +1,4 @@
+instaloader>=4.11
+pytest>=7.0
+requests>=2.31
+tzdata>=2024.1  # required for zoneinfo("Asia/Kolkata") on Windows / minimal Linux images that ship no IANA tz database
