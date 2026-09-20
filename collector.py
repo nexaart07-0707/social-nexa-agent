@@ -77,7 +77,17 @@ def get_anonymous_loader() -> instaloader.Instaloader:
     """Build a plain, logged-out Instaloader instance — no session file, no
     login. Mirrors the constructor kwargs the old session_manager.get_loader()
     used (download flags off; this project only reads profile/post metadata,
-    never downloads media)."""
+    never downloads media).
+
+    ponytail: instaloader defaults to request_timeout=300.0 (5 minutes!) and
+    max_connection_attempts=3 -- stacked with this module's own _with_backoff
+    (2 attempts), a single stalled/slow-throttled anonymous request could
+    wait up to ~30 minutes before giving up. Found via live GitHub Actions
+    runs that stayed "in progress" for 15-20+ minutes even with a tiny
+    (2-city) discovery scope. Set explicit short values here so one slow
+    call fails fast into our own backoff logic instead of instaloader's
+    internal retries silently eating most of the run's time budget.
+    """
     return instaloader.Instaloader(
         download_pictures=False,
         download_videos=False,
@@ -86,6 +96,8 @@ def get_anonymous_loader() -> instaloader.Instaloader:
         download_comments=False,
         save_metadata=False,
         compress_json=False,
+        request_timeout=10.0,
+        max_connection_attempts=1,
     )
 
 
