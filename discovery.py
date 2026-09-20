@@ -66,19 +66,19 @@ HUBLI = "Hubli, Karnataka, India"
 # spread of major metros across different states/regions, so a nationwide
 # run isn't biased toward one region.
 #
-# ponytail: kept to 6 cities (was 20) after a live GitHub Actions run showed
-# the unconditional city x niche x tag sweep at >=1 req/s to Nominatim is a
-# ~7min fixed cost regardless of any candidate cap downstream -- cut here so
-# a full run finishes in a reasonable window. Upgrade path: rotate which 6
-# cities are used per run (e.g. by day-of-week) if broader nationwide
-# coverage over time is wanted without paying the full 20-city cost per run.
+# ponytail: cut from 20 to 6 to 2 cities after THREE consecutive live GitHub
+# Actions runs (53+min, 20+min, 18+min) confirmed the unconditional city x
+# niche x tag sweep at >=1 req/s to Nominatim is the dominant fixed cost
+# regardless of the candidate cap downstream. 2 cities is a deliberately
+# small proof-of-pipeline scope for a fast verification run -- widen back
+# toward the original 6-20 once the pipeline is confirmed working
+# end-to-end, since a 2-city nationwide sweep is not representative
+# coverage for real production use. Upgrade path: rotate which cities are
+# used per run (e.g. by day-of-week) for broader coverage over time without
+# paying the full N-city cost on every single run.
 NATIONWIDE_CITIES: list[str] = [
     "Mumbai, Maharashtra, India",
     "Delhi, India",
-    "Bengaluru, Karnataka, India",
-    "Chennai, Tamil Nadu, India",
-    "Kolkata, West Bengal, India",
-    "Ahmedabad, Gujarat, India",
 ]
 
 # Per-niche OSM tag mapping. Each niche maps to a list of (osm_key, osm_value)
