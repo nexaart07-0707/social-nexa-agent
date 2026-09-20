@@ -1,15 +1,14 @@
 """
 Module 5 (part 2) — Notification.
 
-Owns: sending the Telegram run-summary message. Does NOT own scoring or
-CSV writing — see Architecture.md module boundaries.
+Owns: sending the daily prospect-report email. Does NOT own scoring or CSV
+writing — see Architecture.md module boundaries.
 
-Real end-to-end delivery requires a human-provided Telegram bot: message
-@BotFather on Telegram, run /newbot, and it returns a bot token. Then
-message the new bot once (any text) and read
-https://api.telegram.org/bot<token>/getUpdates to find your chat id.
-Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID as env vars — no code changes
-needed once they're present.
+Email (Gmail SMTP) is the SOLE notification/reporting channel for this
+project — there is no second channel to fall back to. This covers both the
+1PM/5PM research runs (each sends its own report immediately on completion,
+via orchestrator.py's call to send_daily_email_report()) and the 8PM
+consolidated report (orchestrator.py --report).
 """
 
 from __future__ import annotations
@@ -24,86 +23,18 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any
 
-import requests
-
 import storage
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
-
-
-def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
-    """
-    Send `text` to `chat_id` via the Telegram Bot API. Never raises — per
-    Architecture.md's failure-isolation rule, a network failure is logged
-    and this returns False.
-    """
-    url = TELEGRAM_API_URL.format(token=bot_token)
-    try:
-        response = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
-        if response.status_code == 200:
-            return True
-        logger.error(
-            "Telegram send failed: status=%s body=%s", response.status_code, response.text
-        )
-        return False
-    except requests.RequestException as exc:
-        logger.error("Telegram send raised an exception: %s", exc)
-        return False
-
-
-def notify_run_complete(csv_path: str | None, records: list[dict], errors: list | None = None) -> bool:
-    """
-    Build and send a run-summary Telegram message: total candidates
-    processed, count flagged needs_manual_review, error count, and the CSV
-    file path/name.
-
-    If TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars are absent (expected
-    in this build/test environment, which has no real Telegram bot), logs a
-    clear warning and skips sending rather than crashing. Once a human
-    operator sets both env vars with real credentials (see module
-    docstring), this starts sending for real with no code changes.
-    """
-    errors = errors or []
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-    if not bot_token or not chat_id:
-        logger.warning(
-            "TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID not set — skipping Telegram "
-            "notification. Set both env vars with real credentials from @BotFather "
-            "to enable real delivery."
-        )
-        return False
-
-    total = len(records)
-    flagged = sum(1 for r in records if "needs_manual_review" in (r.get("flags") or []))
-    csv_name = csv_path if csv_path else "(CSV write failed — see logs)"
-
-    text = (
-        "Social Nexa Agent — run complete\n"
-        f"Candidates processed: {total}\n"
-        f"Flagged needs_manual_review: {flagged}\n"
-        f"Errors encountered: {len(errors)}\n"
-        f"Output file: {csv_name}"
-    )
-
-    return send_telegram_message(bot_token, chat_id, text)
-
 
 # ---------------------------------------------------------------------------
-# Daily email report (Module 5 extension)
+# Daily email report (Module 5)
 #
-# Sends the day's per-run report as a self-send HTML email via Gmail SMTP
-# (stdlib smtplib + email.mime — no new dependency). Independent of the
-# run1/run2 research triggers: this only formats and emails data a run
-# already produced (see scheduler_rules.is_report_time() for the 8:00 PM
-# IST trigger point, and daily_report.py-style cron invocation in
-# scheduler_rules.py's crontab comments).
+# Sends a run's report as a self-send HTML email via Gmail SMTP (stdlib
+# smtplib + email.mime — no new dependency).
 #
-# Credentials (never hardcoded, same env-var pattern as TELEGRAM_BOT_TOKEN/
-# TELEGRAM_CHAT_ID above):
+# Credentials (never hardcoded):
 #   GMAIL_APP_PASSWORD    — required; a Gmail App Password (not the account
 #                           password). Generate at
 #                           https://myaccount.google.com/apppasswords after
@@ -291,8 +222,6 @@ def send_daily_email_report(
     run: str,
     scored_records: list[dict],
     run_date: date,
-    telegram_bot_token: str | None = None,
-    telegram_chat_id: str | None = None,
 ) -> bool:
     """
     Send that day's report for one run (`run` is "run1" or "run2") as a
@@ -307,9 +236,9 @@ def send_daily_email_report(
 
     Never raises (Architecture.md failure-isolation pattern, same as every
     other external call in this codebase): on any send failure, logs the
-    error and falls back to notify_run_complete's underlying
-    send_telegram_message() with a message noting the email failed. Returns
-    True only if the email itself was sent successfully.
+    error clearly and returns False. Email is the sole notification channel
+    now (Telegram was removed) so there is no fallback channel to send to --
+    a send failure is only ever surfaced via the GitHub Actions log.
     """
     sender = os.environ.get("GMAIL_SENDER_EMAIL", _DEFAULT_GMAIL_ACCOUNT)
     recipient = os.environ.get("GMAIL_RECIPIENT_EMAIL", _DEFAULT_GMAIL_ACCOUNT)
@@ -341,21 +270,11 @@ def send_daily_email_report(
         return True
 
     except Exception as exc:  # noqa: BLE001 -- deliberate broad catch, see docstring
-        logger.error("Daily email report send failed for %s (%s): %s", run, run_date.isoformat(), exc)
-
-        bot_token = telegram_bot_token or os.environ.get("TELEGRAM_BOT_TOKEN")
-        chat_id = telegram_chat_id or os.environ.get("TELEGRAM_CHAT_ID")
-        if bot_token and chat_id:
-            send_telegram_message(
-                bot_token,
-                chat_id,
-                f"Daily email report FAILED for {run} ({run_date.isoformat()}): {exc}",
-            )
-        else:
-            logger.warning(
-                "Telegram fallback also unavailable (TELEGRAM_BOT_TOKEN/"
-                "TELEGRAM_CHAT_ID not set) -- email failure was not reported anywhere."
-            )
+        # No second channel to fall back to (Telegram removed) -- just log
+        # clearly so a human watching the GitHub Actions log sees it.
+        logger.error(
+            "Daily email report FAILED for %s (%s): %s", run, run_date.isoformat(), exc
+        )
         return False
 
 

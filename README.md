@@ -2,11 +2,13 @@
 
 Social Nexa Agent is an unattended lead-generation pipeline: twice a day it
 discovers local businesses on Instagram in a target city/niche set (per
-`docs/PRD.md`), collects their public profile/post data through a
-persisted Instagram session, scores each one against a fixed rule-based
-"opportunity score" (no AI/LLM judgment anywhere in the scoring path), and
-writes the results to a CSV while notifying a human via Telegram. Once a day
-it also emails a consolidated report of the day's two runs. It now runs
+`docs/PRD.md`), collects their public profile/post data via
+public/unauthenticated Instagram access (no login, no session), scores each
+one against a fixed rule-based "opportunity score" (no AI/LLM judgment
+anywhere in the scoring path), and emails the results to a human (Gmail —
+the sole notification channel). Each run emails its own report immediately
+on completion, and once a day it also emails a consolidated report of the
+day's two runs. It now runs
 entirely on **GitHub Actions against a public repository** — no VM, no
 crontab — using GitHub's free scheduled-workflow triggers (see
 `docs/Architecture.md` section 5 and `docs/PRD.md` constraint 4 for why this
@@ -28,55 +30,21 @@ git push -u origin main
 The repo **must be public** — GitHub's unlimited free Actions minutes with
 no card/cap requires a public repository (PRD.md constraint 4).
 
-### b) Run the one-time local Instagram login
-
-This produces the session file `session_manager.py` reuses on every run.
-Do this once, on your own machine, with real credentials:
-
-```bash
-export IG_USERNAME="your_instagram_username"
-export IG_PASSWORD="your_instagram_password"
-python session_manager.py
-```
-
-On success this writes `session/<IG_USERNAME>.session` (see
-`session_manager.default_session_path()` — the directory defaults to
-`./session`, overridable via `IG_SESSION_DIR`/`IG_SESSION_FILE`). If
-Instagram raises a checkpoint/2FA challenge, `session_manager.py` halts and
-logs it — resolve the challenge in the Instagram app/site first, then
-re-run.
-
-### c) Base64-encode the session file
-
-**Linux/Mac:**
-```bash
-base64 -w 0 session/<your_username>.session > session_b64.txt
-```
-
-**Windows PowerShell:**
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("session\<your_username>.session")) | Out-File -NoNewline session_b64.txt
-```
-
-Both commands were verified locally to round-trip byte-for-byte (encode →
-decode reproduces the original file exactly) as part of this build.
-
-### d) Add repository secrets
+### b) Add repository secrets
 
 In the GitHub repo: **Settings → Secrets and variables → Actions → New
 repository secret**. Add:
 
-| Secret | Value |
-|---|---|
-| `IG_USERNAME` | Your Instagram username (needed to build the session filename) |
-| `IG_SESSION_B64` | The full contents of `session_b64.txt` from step (c) |
-| `GMAIL_APP_PASSWORD` | A Gmail App Password (not your account password) — generate at https://myaccount.google.com/apppasswords after enabling 2-Step Verification |
-| `GMAIL_SENDER_EMAIL` | *(optional)* defaults to the address baked into `notifier.py` if omitted |
-| `GMAIL_RECIPIENT_EMAIL` | *(optional)* defaults the same way if omitted |
-| `TELEGRAM_BOT_TOKEN` | From @BotFather (`/newbot`) |
-| `TELEGRAM_CHAT_ID` | From `https://api.telegram.org/bot<token>/getUpdates` after messaging your bot once |
+| Secret | Required? | Value |
+|---|---|---|
+| `GMAIL_APP_PASSWORD` | **Required** | A Gmail App Password (not your account password) — generate at https://myaccount.google.com/apppasswords after enabling 2-Step Verification |
+| `GMAIL_SENDER_EMAIL` | Optional | defaults to the address baked into `notifier.py` if omitted |
+| `GMAIL_RECIPIENT_EMAIL` | Optional | defaults the same way if omitted |
 
 Never commit any of these values — the repo is public.
+
+There is no Instagram login/session secret to set up: collection is
+public/unauthenticated (see `collector.get_anonymous_loader()`).
 
 ## How the schedule works
 
@@ -96,23 +64,14 @@ delayed anywhere from a few minutes up to roughly an hour. A run firing
 15–60 minutes late is expected platform behavior, not a bug in this
 workflow or in `scheduler_rules.py`'s window logic.
 
-## Session refresh process
+## No session to manage
 
-If the saved Instagram session expires or Instagram issues a
-checkpoint/challenge, the "Validate Instagram session" step in the workflow
-detects it via `session_manager.ensure_session()`'s own real validation (not
-a re-implemented check), sends a Telegram alert with the message:
-
-> Instagram session invalid or missing — re-run the local one-time login and
-> update the IG_SESSION_B64 secret
-
-...and the job exits non-zero (a genuine, visible failure in the Actions
-tab), rather than continuing to run with a broken session.
-
-**To fix it:** repeat steps (b)–(d) above — re-run `session_manager.py`
-locally, re-encode the new session file, and update the `IG_SESSION_B64`
-repository secret with the new value (the other secrets don't need to
-change).
+There is no login/session to refresh — collection is public/unauthenticated,
+so there's nothing to expire and no credentials to rotate for Instagram
+access. It IS still subject to Instagram's own anonymous rate-limiting,
+which shows up as more `"unavailable"` fields in the output per this
+project's existing data-quality design (see "Known limitations" below) —
+that's expected behavior, not a workflow failure.
 
 ## The 60-day inactivity rule
 
@@ -123,10 +82,9 @@ trivial `last_run.txt` timestamp (bot identity `github-actions[bot]`,
 out of the public repo's git history entirely (per Architecture.md §5) and
 is instead uploaded as a per-run workflow artifact.
 
-That commit step runs with `if: always()`, so it still executes even when
-the session-validation step above fails and exits the job non-zero — a
-failing pipeline (e.g. an expired session nobody has fixed yet) still keeps
-the repo "active" and won't trip the 60-day auto-disable on its own.
+That commit step runs with `if: always()`, so it still executes even when an
+earlier step fails and exits the job non-zero — a failing pipeline still
+keeps the repo "active" and won't trip the 60-day auto-disable on its own.
 
 The one scenario this doesn't cover: if the workflow stops running
 *entirely* — the schedule itself gets disabled by a human, GitHub has an
@@ -138,8 +96,8 @@ anything if the workflow never runs at all.
 ## How to check logs
 
 GitHub repo → **Actions** tab → select the `Daily Runs` workflow → click the
-specific run → click the `run` job to see step-by-step logs (session
-validation, orchestrator output, etc).
+specific run → click the `run` job to see step-by-step logs (orchestrator
+output, etc).
 
 To download that run's CSV: same run page → **Artifacts** section at the
 bottom → download `leads-csv-<run-id>` (zipped).
@@ -179,14 +137,20 @@ this project follows before making structural changes.
   that a more complete scoring pass could use. See each module's own notes.
 - **Reels-ratio edge case** in the scoring logic — see `docs/Scoring-Spec.md`
   and `analyzer.py` for the specific boundary condition.
-- **Real Telegram/Gmail delivery is confirmed working** with human-provided
+- **No Instagram login means more frequent `"unavailable"` fields.**
+  Without an authenticated session, Instagram exposes less to logged-out
+  requests — on borderline-private or rate-limited accounts, or certain post
+  metadata, some fields may show `"unavailable"` more often than a
+  logged-in session would see. This is expected, not a bug, per this
+  project's existing rule to never treat `"unavailable"` as zero. See
+  `collector.py`'s module docstring.
+- **Real Gmail delivery is confirmed working** with human-provided
   credentials — already validated in an earlier build pass, not re-litigated
   here.
 - **Real GitHub Actions end-to-end execution is PENDING.** Everything up to
   the point of actually creating the repo and secrets has been built and
-  locally validated (workflow YAML syntax/logic, the base64 round-trip, the
-  `orchestrator.py --report` glue and its tests, full test suite). The
-  worker that built this cannot create a GitHub repository, push code, add
-  secrets, or trigger a real Actions run — that is explicitly the human's
-  action to take next, exactly as the original Telegram/Gmail credential
-  setup was handled.
+  locally validated (workflow YAML syntax/logic, the `orchestrator.py
+  --report` glue and its tests, full test suite). The worker that built this
+  cannot create a GitHub repository, push code, add secrets, or trigger a
+  real Actions run — that is explicitly the human's action to take next,
+  exactly as the original Gmail credential setup was handled.

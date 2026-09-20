@@ -2,10 +2,6 @@
 .env
 .env.*
 
-# Instagram session storage (Module 1 — session_manager.py)
-/session/
-*.session
-
 # Python
 __pycache__/
 *.pyc

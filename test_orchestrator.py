@@ -13,10 +13,7 @@ from datetime import date as _date
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-import pytest
-
 import orchestrator
-import session_manager
 
 
 IST_RUN1_TIME = datetime(2026, 9, 19, 14, 0, 0, tzinfo=timezone.utc)  # arbitrary tz-aware dt
@@ -54,15 +51,15 @@ def _record(handle="somehandle"):
 
 def test_no_active_window_exits_early_without_calling_anything_else():
     with patch("orchestrator.scheduler_rules.get_window_for_time", return_value=None) as mock_window, \
-         patch("orchestrator.session_manager.ensure_session") as mock_session, \
+         patch("orchestrator.collector.get_anonymous_loader") as mock_loader, \
          patch("orchestrator.discovery.discover_for_run") as mock_discovery, \
          patch("orchestrator.collector.collect_many") as mock_collect, \
          patch("orchestrator.storage.write_leads_csv") as mock_storage, \
-         patch("orchestrator.notifier.notify_run_complete") as mock_notify:
+         patch("orchestrator.notifier.send_daily_email_report") as mock_notify:
         summary = orchestrator.run(run_name=None, dry_run=False)
 
     mock_window.assert_called_once()
-    mock_session.assert_not_called()
+    mock_loader.assert_not_called()
     mock_discovery.assert_not_called()
     mock_collect.assert_not_called()
     mock_storage.assert_not_called()
@@ -77,46 +74,6 @@ def test_no_active_window_exits_early_without_calling_anything_else():
 
 
 # ---------------------------------------------------------------------------
-# (b) session_manager halt exception -> stops immediately, notifies, and
-#     never calls discovery/collector/analyzer/storage
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "exc_cls",
-    [
-        session_manager.SessionInvalidError,
-        session_manager.ChallengeRequiredError,
-        session_manager.SessionManagerError,
-    ],
-)
-def test_session_halt_stops_run_and_notifies(exc_cls):
-    with patch("orchestrator.session_manager.ensure_session", side_effect=exc_cls("boom")), \
-         patch("orchestrator.discovery.discover_for_run") as mock_discovery, \
-         patch("orchestrator.collector.collect_many") as mock_collect, \
-         patch("orchestrator.analyzer.analyze") as mock_analyze, \
-         patch("orchestrator.storage.write_leads_csv") as mock_storage, \
-         patch("orchestrator.notifier.notify_run_complete") as mock_notify:
-        summary = orchestrator.run(run_name="run1", dry_run=False)
-
-    mock_discovery.assert_not_called()
-    mock_collect.assert_not_called()
-    mock_analyze.assert_not_called()
-    mock_storage.assert_not_called()
-    mock_notify.assert_called_once()
-    # notify_run_complete(csv_path=None, records=[], errors=[<message>])
-    _, kwargs = mock_notify.call_args
-    call_args = mock_notify.call_args.args
-    all_args = call_args + tuple(kwargs.values())
-    assert None in all_args or mock_notify.call_args.kwargs.get("csv_path") is None
-    assert summary["csv_path"] is None
-    assert summary["candidates_found"] == 0
-    assert summary["records_collected"] == 0
-    assert summary["records_scored"] == 0
-    assert len(summary["errors"]) == 1
-
-
-# ---------------------------------------------------------------------------
 # (c) discovery failure doesn't crash the run: continues with empty
 #     candidates, still completes and calls storage/notifier with zero
 #     records
@@ -124,17 +81,18 @@ def test_session_halt_stops_run_and_notifies(exc_cls):
 
 
 def test_discovery_failure_continues_with_empty_candidates():
-    with patch("orchestrator.session_manager.ensure_session", return_value=None), \
-         patch("orchestrator.session_manager.get_loader", return_value=object()), \
+    with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
          patch("orchestrator.discovery.discover_for_run", side_effect=RuntimeError("nominatim down")), \
          patch("orchestrator.collector.collect_many") as mock_collect, \
          patch("orchestrator.storage.write_leads_csv", return_value="output/leads_x.csv") as mock_storage, \
-         patch("orchestrator.notifier.notify_run_complete", return_value=False) as mock_notify:
+         patch("orchestrator.notifier.send_daily_email_report", return_value=False) as mock_notify:
         summary = orchestrator.run(run_name="run1", dry_run=False)
 
     mock_collect.assert_not_called()
     mock_storage.assert_called_once_with([])
-    mock_notify.assert_called_once_with("output/leads_x.csv", [], summary["errors"])
+    mock_notify.assert_called_once()
+    assert mock_notify.call_args.args[0] == "run1"
+    assert mock_notify.call_args.args[1] == []
     assert summary["candidates_found"] == 0
     assert summary["records_collected"] == 0
     assert summary["records_scored"] == 0
@@ -165,16 +123,15 @@ def test_happy_path_calls_every_step_in_order_and_builds_summary():
             manager.append(name)
         return _inner
 
-    with patch("orchestrator.session_manager.ensure_session", side_effect=track("session")), \
-         patch("orchestrator.session_manager.get_loader", return_value=object()), \
+    with patch("orchestrator.collector.get_anonymous_loader", side_effect=track("loader")), \
          patch("orchestrator.discovery.discover_for_run", side_effect=lambda *a, **k: (track("discovery")(), candidates)[1]), \
          patch("orchestrator.collector.collect_many", side_effect=lambda *a, **k: (track("collect")(), records)[1]), \
          patch("orchestrator.analyzer.analyze", side_effect=lambda rec, niche, **k: (track("analyze")(), analyzed[[r["handle"] for r in records].index(rec["handle"])])[1]), \
          patch("orchestrator.storage.write_leads_csv", side_effect=lambda *a, **k: (track("storage")(), "output/leads_y.csv")[1]) as mock_storage, \
-         patch("orchestrator.notifier.notify_run_complete", side_effect=lambda *a, **k: (track("notify")(), True)[1]) as mock_notify:
+         patch("orchestrator.notifier.send_daily_email_report", side_effect=lambda *a, **k: (track("notify")(), True)[1]) as mock_notify:
         summary = orchestrator.run(run_name="run1", dry_run=False)
 
-    assert manager == ["session", "discovery", "collect", "analyze", "analyze", "storage", "notify"]
+    assert manager == ["loader", "discovery", "collect", "analyze", "analyze", "storage", "notify"]
 
     # storage got (candidate, analyzed) pairs
     storage_call_rows = mock_storage.call_args.args[0]
@@ -182,9 +139,9 @@ def test_happy_path_calls_every_step_in_order_and_builds_summary():
     assert storage_call_rows[0][0]["handle_guess"] == "handleone"
     assert storage_call_rows[0][1]["handle"] == "handleone"
 
-    # notifier got the analyzed records list
+    # notifier got the run name and the analyzed records list
     notify_args = mock_notify.call_args.args
-    assert notify_args[0] == "output/leads_y.csv"
+    assert notify_args[0] == "run1"
     assert len(notify_args[1]) == 2
 
     assert summary == {
@@ -194,6 +151,29 @@ def test_happy_path_calls_every_step_in_order_and_builds_summary():
         "csv_path": "output/leads_y.csv",
         "errors": [],
     }
+
+
+def test_successful_run_emails_its_own_report_with_run_records_and_todays_ist_date():
+    """After a successful run1/run2 pass, notifier.send_daily_email_report must be
+    called with (run, analyzed_records, today's IST date) -- and no Telegram
+    function exists to call instead (Telegram has been removed entirely)."""
+    candidates = [_candidate("handleone", "cafes/bakeries/home-food")]
+    records = [_record("handleone")]
+    analyzed = [{"handle": "handleone", "niche": "cafes/bakeries/home-food",
+                 "category_scores": {}, "total_score": 5, "flags": [], "manual_review": [],
+                 "profile_metrics": {}, "data_quality": {}}]
+    fixed_date = _date(2026, 9, 20)
+
+    with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.discovery.discover_for_run", return_value=candidates), \
+         patch("orchestrator.collector.collect_many", return_value=records), \
+         patch("orchestrator.analyzer.analyze", return_value=analyzed[0]), \
+         patch("orchestrator.storage.write_leads_csv", return_value="output/leads_y.csv"), \
+         patch("orchestrator.scheduler_rules.now_ist", return_value=datetime(2026, 9, 20, 13, 30, tzinfo=timezone.utc)), \
+         patch("orchestrator.notifier.send_daily_email_report", return_value=True) as mock_send_email:
+        orchestrator.run(run_name="run1", dry_run=False)
+
+    mock_send_email.assert_called_once_with("run1", analyzed, fixed_date)
 
 
 # ---------------------------------------------------------------------------
@@ -215,13 +195,12 @@ def test_one_bad_record_does_not_stop_others_from_being_scored():
                 "total_score": 1, "flags": [], "manual_review": [], "profile_metrics": {},
                 "data_quality": {}}
 
-    with patch("orchestrator.session_manager.ensure_session", return_value=None), \
-         patch("orchestrator.session_manager.get_loader", return_value=object()), \
+    with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
          patch("orchestrator.discovery.discover_for_run", return_value=candidates), \
          patch("orchestrator.collector.collect_many", return_value=records), \
          patch("orchestrator.analyzer.analyze", side_effect=fake_analyze), \
          patch("orchestrator.storage.write_leads_csv", return_value="output/leads_z.csv") as mock_storage, \
-         patch("orchestrator.notifier.notify_run_complete", return_value=False) as mock_notify:
+         patch("orchestrator.notifier.send_daily_email_report", return_value=False) as mock_notify:
         summary = orchestrator.run(run_name="run1", dry_run=False)
 
     storage_rows = mock_storage.call_args.args[0]

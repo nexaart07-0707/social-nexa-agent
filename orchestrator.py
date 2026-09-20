@@ -40,8 +40,15 @@ FAILED-RECORD HANDLING design decision (also ambiguous in the brief):
     force-fed through analyze() a second time with synthetic data. This
     keeps the CSV honest (only genuinely-scored rows appear in it) while
     still surfacing the failure count in both the summary dict and the
-    Telegram notification (`errors` list -> notify_run_complete's error
-    count).
+    daily email report.
+--------------------------------------------------------------------------
+
+ARCHITECTURE NOTE: Instagram login has been removed entirely. Collection is
+now always anonymous/unauthenticated (collector.get_anonymous_loader()) --
+no session file, no login, no session-failure halt mode. Email (notifier.py)
+is the sole notification channel; Telegram has been removed. Each run1/run2
+pass sends its own email report immediately on completion (see Step 6/6
+below), in addition to the 8PM consolidated report via run_report().
 --------------------------------------------------------------------------
 """
 
@@ -60,7 +67,6 @@ import collector
 import discovery
 import notifier
 import scheduler_rules
-import session_manager
 import storage
 
 logging.basicConfig(
@@ -91,23 +97,6 @@ def _determine_run(run_override: str | None) -> str | None:
     return window
 
 
-def _halt_run(message: str) -> dict:
-    """Session-failure path: per Module 1's own DoD this is a WHOLE-RUN halt,
-    not a per-step continue. No downstream module is called at all."""
-    logger.error("HALTING RUN: %s", message)
-    try:
-        notifier.notify_run_complete(csv_path=None, records=[], errors=[message])
-    except Exception:  # noqa: BLE001 - notification must never mask the halt
-        logger.exception("notify_run_complete raised while reporting the halt.")
-    return {
-        "candidates_found": 0,
-        "records_collected": 0,
-        "records_scored": 0,
-        "csv_path": None,
-        "errors": [message],
-    }
-
-
 def run(run_name: str | None = None, dry_run: bool = False) -> dict:
     """
     Execute one full orchestrator pass.
@@ -116,11 +105,11 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
         run_name: "run1" / "run2" to force a specific window (testing/dry-run),
             or None to auto-detect from the current IST time via
             scheduler_rules.
-        dry_run: if True, fakes every external call (session, discovery,
-            collection, Telegram) with synthetic in-memory data so the full
-            pipeline can be exercised with zero real network/Instagram/
-            Telegram calls. The CSV is still written for real (cheap, local,
-            safe) so the pipeline's actual output shape is proven end to end.
+        dry_run: if True, fakes every external call (discovery, collection,
+            email) with synthetic in-memory data so the full pipeline can be
+            exercised with zero real network/Instagram/email calls. The CSV
+            is still written for real (cheap, local, safe) so the pipeline's
+            actual output shape is proven end to end.
 
     Returns:
         Summary dict: candidates_found, records_collected, records_scored,
@@ -150,34 +139,22 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
             "csv_path": None,
             "errors": [],
         }
-    print(f"[orchestrator] Step 1/7: run window = {determined_run}")
+    print(f"[orchestrator] Step 1/6: run window = {determined_run}")
 
-    # ---- Step 2: ensure a ready Instagram session --------------------------
+    # ---- Step 2: build the (anonymous) Instagram loader ---------------------
     if dry_run:
-        print("[orchestrator] Step 2/7: session_manager.ensure_session() -- FAKED (dry-run), "
-              "no real Instagram login/session check performed.")
+        print("[orchestrator] Step 2/6: collector.get_anonymous_loader() -- FAKED (dry-run), "
+              "no real Instagram calls performed.")
         loader = _dry_run_fake_loader()
     else:
-        try:
-            session_manager.ensure_session()
-        except (
-            session_manager.SessionInvalidError,
-            session_manager.ChallengeRequiredError,
-            session_manager.SessionManagerError,
-        ) as exc:
-            # Deliberate exception to the general "log and continue" rule:
-            # per Module 1's own DoD, a session failure halts the WHOLE run
-            # (nothing downstream can work without a session), rather than
-            # being isolated to "this step failed, continue with a gap."
-            return _halt_run(f"Session unavailable, halting run per Module 1 DoD: {exc}")
-        loader = session_manager.get_loader()
-        print("[orchestrator] Step 2/7: session ready.")
+        loader = collector.get_anonymous_loader()
+        print("[orchestrator] Step 2/6: anonymous Instagram loader ready (no login).")
 
     # ---- Step 3: discovery --------------------------------------------------
     candidates: list[dict] = []
     if dry_run:
         candidates = _dry_run_fake_candidates(determined_run)
-        print(f"[orchestrator] Step 3/7: discovery.discover_for_run() -- FAKED (dry-run), "
+        print(f"[orchestrator] Step 3/6: discovery.discover_for_run() -- FAKED (dry-run), "
               f"{len(candidates)} synthetic candidate(s).")
     else:
         try:
@@ -186,7 +163,7 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
             logger.exception("discovery.discover_for_run failed; continuing with zero candidates.")
             errors.append(f"discovery failed: {exc}")
             candidates = []
-        print(f"[orchestrator] Step 3/7: discovery found {len(candidates)} candidate(s).")
+        print(f"[orchestrator] Step 3/6: discovery found {len(candidates)} candidate(s).")
 
     # ---- Step 4: collection ---------------------------------------------------
     # KNOWN LIMITATION (see module docstring): handle_guess is used directly
@@ -196,7 +173,7 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
     if candidates:
         if dry_run:
             records = _dry_run_fake_records(handles)
-            print(f"[orchestrator] Step 4/7: collector.collect_many() -- FAKED (dry-run), "
+            print(f"[orchestrator] Step 4/6: collector.collect_many() -- FAKED (dry-run), "
                   f"{len(records)} synthetic record(s).")
         else:
             try:
@@ -205,9 +182,9 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
                 logger.exception("collector.collect_many failed; continuing with zero records.")
                 errors.append(f"collection failed: {exc}")
                 records = []
-            print(f"[orchestrator] Step 4/7: collected {len(records)} record(s).")
+            print(f"[orchestrator] Step 4/6: collected {len(records)} record(s).")
     else:
-        print("[orchestrator] Step 4/7: skipped (no candidates to collect).")
+        print("[orchestrator] Step 4/6: skipped (no candidates to collect).")
 
     # ---- Step 5: analysis / scoring ---------------------------------------
     # candidates and records are index-aligned (collect_many preserves the
@@ -226,29 +203,36 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
             continue
         scored_pairs.append((candidate, analyzed))
         analyzed_records.append(analyzed)
-    print(f"[orchestrator] Step 5/7: scored {len(analyzed_records)} record(s) "
+    print(f"[orchestrator] Step 5/6: scored {len(analyzed_records)} record(s) "
           f"({len(records) - len(analyzed_records)} skipped due to analysis errors).")
 
     # ---- Step 6: write CSV (always real, even in dry-run) ------------------
     csv_path: str | None = None
     try:
         csv_path = storage.write_leads_csv(scored_pairs)
-        print(f"[orchestrator] Step 6/7: CSV written to {csv_path!r}.")
+        print(f"[orchestrator] Step 6/6: CSV written to {csv_path!r}.")
     except Exception as exc:  # noqa: BLE001 - failure isolation, per Architecture.md §6
         logger.exception("storage.write_leads_csv failed unexpectedly.")
         errors.append(f"csv write failed: {exc}")
 
-    # ---- Step 7: Telegram completion notification --------------------------
+    # ---- Step 6b: email report for THIS run, sent immediately -------------
+    # Email is the sole notification channel now (Telegram removed). Each
+    # run1/run2 pass sends its own report right away, rather than only at
+    # 8PM (run_report() still separately sends the 8PM consolidated report
+    # by reading back today's CSVs -- unchanged).
     if dry_run:
-        print("[orchestrator] Step 7/7: notifier.notify_run_complete() -- Telegram send FAKED "
-              "(dry-run); notifier's own no-token-set skip path is exercised for real.")
-    try:
-        sent = notifier.notify_run_complete(csv_path, analyzed_records, errors)
-        print(f"[orchestrator] Step 7/7: notify_run_complete() returned {sent} "
-              f"(False is expected/normal when no Telegram credentials are configured).")
-    except Exception as exc:  # noqa: BLE001 - failure isolation, per Architecture.md §6
-        logger.exception("notifier.notify_run_complete failed unexpectedly.")
-        errors.append(f"notification failed: {exc}")
+        print("[orchestrator] Step 6b: notifier.send_daily_email_report() -- FAKED (dry-run), "
+              "no real email sent.")
+    else:
+        try:
+            sent = notifier.send_daily_email_report(
+                determined_run, analyzed_records, scheduler_rules.now_ist().date()
+            )
+            logger.info("send_daily_email_report(%s) returned %s", determined_run, sent)
+            print(f"[orchestrator] Step 6b: send_daily_email_report() returned {sent}.")
+        except Exception as exc:  # noqa: BLE001 - failure isolation, per Architecture.md §6
+            logger.exception("notifier.send_daily_email_report failed unexpectedly.")
+            errors.append(f"notification failed: {exc}")
 
     summary = {
         "candidates_found": len(candidates),
@@ -264,8 +248,8 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # --dry-run synthetic data helpers
 # ---------------------------------------------------------------------------
-# These fake ONLY the external-service calls (Instagram session/login,
-# Nominatim discovery, Instagram profile collection, Telegram send).
+# These fake ONLY the external-service calls (Instagram loader construction,
+# Nominatim discovery, Instagram profile collection, email send).
 # storage.write_leads_csv() and analyzer.analyze() are the REAL functions,
 # run for real against this synthetic data, so the CSV produced is a
 # genuine, correctly-structured artifact -- not itself faked.
@@ -476,7 +460,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Exercise the full pipeline with synthetic data; no real network/Instagram/"
-             "Telegram calls. Still writes a real CSV to output/.",
+             "email calls. Still writes a real CSV to output/.",
     )
     parser.add_argument(
         "--report", action="store_true",
@@ -494,15 +478,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print("=" * 70)
-        print("DRY RUN — no real Instagram/Nominatim/Telegram calls will be made.")
+        print("DRY RUN — no real Instagram/Nominatim/email calls will be made.")
         print("=" * 70)
 
     summary = run(run_name=args.run, dry_run=args.dry_run)
     logger.debug("CLI run summary: %s", summary)
 
-    # A run that never got started (outside both windows, no override) or a
-    # halted run (session failure) both still exit 0 -- both are documented,
-    # clean, non-crashing outcomes, not process failures.
+    # A run that never got started (outside both windows, no override) still
+    # exits 0 -- a documented, clean, non-crashing outcome, not a process
+    # failure.
     return 0
 
 

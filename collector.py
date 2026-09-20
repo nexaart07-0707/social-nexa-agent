@@ -1,9 +1,15 @@
 """
 Module 3 — Data Collector
 
-Owns: pulling profile/post/highlight data for one Instagram handle, using
-the session from Module 1 (session_manager.py).
+Owns: pulling profile/post/highlight data for one Instagram handle.
 Does NOT own: scoring (Module 4) or discovery/handle-guessing (Module 2).
+
+ALWAYS UNAUTHENTICATED: this project no longer logs into Instagram at all
+(the old session_manager.py / Module 1 login flow has been removed —
+public/unauthenticated collection only, per the project's current
+architecture). `get_anonymous_loader()` below builds a plain, logged-out
+`instaloader.Instaloader()`; orchestrator.py constructs one loader this way
+and reuses it for every handle in a run.
 
 ASSUMPTION (documented per task instructions): Module 2 only produces a
 fuzzy `handle_guess` for a business name — actually resolving that guess
@@ -12,12 +18,16 @@ of scope for this module. `collect_profile`/`collect_many` below take an
 already-resolved/confirmed handle string as input; the guess -> confirmed
 handle resolution step is left to a future module or manual step.
 
-Reuse note: this module does not duplicate any login logic. It expects the
-caller to hand it a ready `instaloader.Instaloader` instance — normally
-built the same way `session_manager.get_loader()` does, after
-`session_manager.ensure_session()` has loaded a valid saved session into it
-(or a plain anonymous `instaloader.Instaloader()` for logged-out fetches,
-which instaloader supports for many public-profile fields).
+Data-quality note (no login): instaloader's anonymous
+`Profile.from_username()` call works the same whether or not the loader is
+logged in, but Instagram exposes less to logged-out requests — on
+borderline-private or rate-limited accounts, or for certain post metadata,
+some fields may come back inaccessible more often than a logged-in session
+would see. This is NOT a new failure mode: it's handled by the same
+"unavailable" marker system below as any other missing field, exactly as
+before. This module doesn't attempt to enumerate precisely which fields are
+affected — instaloader's anonymous-access limitations vary and aren't
+precisely documented upstream either.
 
 Data contract (Module 3 -> 4, per Architecture.md):
     {
@@ -61,6 +71,22 @@ logger = logging.getLogger("collector")
 UNAVAILABLE = "unavailable"
 MAX_POSTS = 15
 RETRYABLE_EXCEPTIONS = (TooManyRequestsException, ConnectionException)
+
+
+def get_anonymous_loader() -> instaloader.Instaloader:
+    """Build a plain, logged-out Instaloader instance — no session file, no
+    login. Mirrors the constructor kwargs the old session_manager.get_loader()
+    used (download flags off; this project only reads profile/post metadata,
+    never downloads media)."""
+    return instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+    )
 
 
 def _empty_result(handle: str, error: str | None = None) -> dict[str, Any]:

@@ -1,16 +1,12 @@
 from datetime import date, datetime, timezone
 from unittest.mock import patch, MagicMock
 
-import requests
-
 import storage
 from notifier import (
     build_report_html,
     build_report_subject,
     load_scored_records_from_csv,
-    notify_run_complete,
     send_daily_email_report,
-    send_telegram_message,
 )
 
 RECORDS = [
@@ -18,63 +14,6 @@ RECORDS = [
     {"handle": "b", "flags": ["needs_manual_review", "verify_still_operating"]},
     {"handle": "c", "flags": []},
 ]
-
-
-def test_send_telegram_message_success():
-    mock_response = MagicMock(status_code=200, text="ok")
-    with patch("notifier.requests.post", return_value=mock_response) as mock_post:
-        result = send_telegram_message("TOKEN", "CHAT", "hello")
-
-    assert result is True
-    args, kwargs = mock_post.call_args
-    assert args[0] == "https://api.telegram.org/botTOKEN/sendMessage"
-    assert kwargs["json"] == {"chat_id": "CHAT", "text": "hello"}
-
-
-def test_send_telegram_message_non_200_returns_false():
-    mock_response = MagicMock(status_code=400, text="bad request")
-    with patch("notifier.requests.post", return_value=mock_response):
-        result = send_telegram_message("TOKEN", "CHAT", "hello")
-    assert result is False
-
-
-def test_send_telegram_message_exception_returns_false_without_raising():
-    with patch("notifier.requests.post", side_effect=requests.exceptions.ConnectionError("no net")):
-        result = send_telegram_message("TOKEN", "CHAT", "hello")
-    assert result is False
-
-
-def test_notify_run_complete_skips_when_env_vars_absent(monkeypatch, caplog):
-    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
-
-    with patch("notifier.send_telegram_message") as mock_send:
-        with caplog.at_level("WARNING"):
-            result = notify_run_complete("output/leads_2026-09-19_1300.csv", RECORDS)
-
-    assert result is False
-    mock_send.assert_not_called()
-    assert "TELEGRAM_BOT_TOKEN" in caplog.text
-
-
-def test_notify_run_complete_sends_summary_when_env_vars_present(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "TOKEN")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "CHAT")
-
-    with patch("notifier.send_telegram_message", return_value=True) as mock_send:
-        result = notify_run_complete(
-            "output/leads_2026-09-19_1300.csv", RECORDS, errors=["timeout on candidate x"]
-        )
-
-    assert result is True
-    mock_send.assert_called_once()
-    (bot_token, chat_id, text), _ = mock_send.call_args
-    assert bot_token == "TOKEN"
-    assert chat_id == "CHAT"
-    assert "Candidates processed: 3" in text
-    assert "Flagged needs_manual_review: 2" in text
-    assert "Errors encountered: 1" in text
-    assert "leads_2026-09-19_1300.csv" in text
 
 
 # ---------------------------------------------------------------------------
@@ -225,46 +164,34 @@ def test_send_daily_email_report_zero_results_still_sends(monkeypatch):
     assert "0 qualifying results." in html_payload
 
 
-def test_send_daily_email_report_missing_app_password_falls_back_to_telegram(monkeypatch):
+def test_send_daily_email_report_missing_app_password_logs_error(monkeypatch, caplog):
+    """No second channel to fall back to (Telegram removed) -- a missing
+    GMAIL_APP_PASSWORD must just be logged clearly, not silently dropped."""
     monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
 
-    with patch("notifier.smtplib.SMTP") as mock_smtp, \
-         patch("notifier.send_telegram_message", return_value=True) as mock_telegram:
-        result = send_daily_email_report(
-            "run1", [SAMPLE_RECORD_HIGH_GAP], date(2026, 9, 19),
-            telegram_bot_token="TOKEN", telegram_chat_id="CHAT",
-        )
+    with patch("notifier.smtplib.SMTP") as mock_smtp, caplog.at_level("ERROR"):
+        result = send_daily_email_report("run1", [SAMPLE_RECORD_HIGH_GAP], date(2026, 9, 19))
 
     assert result is False
     mock_smtp.assert_not_called()
-    mock_telegram.assert_called_once()
-    args, _ = mock_telegram.call_args
-    assert args[0] == "TOKEN"
-    assert args[1] == "CHAT"
-    assert "Daily email report FAILED for run1" in args[2]
+    assert "Daily email report FAILED for run1" in caplog.text
+    assert "GMAIL_APP_PASSWORD" in caplog.text
 
 
-def test_send_daily_email_report_smtp_exception_falls_back_to_telegram(monkeypatch):
+def test_send_daily_email_report_smtp_exception_logs_error(monkeypatch, caplog):
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "app-password-123")
 
     with patch("notifier.smtplib.SMTP", side_effect=OSError("connection refused")), \
-         patch("notifier.send_telegram_message", return_value=True) as mock_telegram:
-        result = send_daily_email_report(
-            "run2", [SAMPLE_RECORD_HIGH_GAP], date(2026, 9, 19),
-            telegram_bot_token="TOKEN", telegram_chat_id="CHAT",
-        )
+         caplog.at_level("ERROR"):
+        result = send_daily_email_report("run2", [SAMPLE_RECORD_HIGH_GAP], date(2026, 9, 19))
 
     assert result is False
-    mock_telegram.assert_called_once()
-    args, _ = mock_telegram.call_args
-    assert "Daily email report FAILED for run2" in args[2]
-    assert "connection refused" in args[2]
+    assert "Daily email report FAILED for run2" in caplog.text
+    assert "connection refused" in caplog.text
 
 
-def test_send_daily_email_report_failure_no_telegram_creds_does_not_raise(monkeypatch):
+def test_send_daily_email_report_failure_does_not_raise(monkeypatch):
     monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
-    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
 
     result = send_daily_email_report("run1", [SAMPLE_RECORD_HIGH_GAP], date(2026, 9, 19))
     assert result is False

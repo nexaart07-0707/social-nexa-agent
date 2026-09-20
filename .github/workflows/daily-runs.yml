@@ -4,10 +4,9 @@ name: Daily Runs
 # Deployment target: GitHub Actions on a PUBLIC repository (Architecture.md
 # section 5 / PRD.md constraint 4, changed 2026-09-19 — supersedes the
 # original VM+cron plan). Each run is a fresh, stateless GitHub-hosted
-# runner: there is no persistent disk, so the Instagram session is restored
-# at the start of every run from the IG_SESSION_B64 repository secret (see
-# the "Restore Instagram session" step below) and never committed to the
-# repo.
+# runner. Instagram collection is public/unauthenticated (no login, no
+# session to restore) and the only notification channel is email (Gmail
+# SMTP) — Telegram has been removed.
 #
 # UTC CRON MATH (GitHub Actions `schedule` cron is ALWAYS interpreted as
 # UTC — there is no way to pin a workflow cron to IST directly). IST is a
@@ -58,12 +57,9 @@ jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      IG_USERNAME: ${{ secrets.IG_USERNAME }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
       GMAIL_SENDER_EMAIL: ${{ secrets.GMAIL_SENDER_EMAIL }}
       GMAIL_RECIPIENT_EMAIL: ${{ secrets.GMAIL_RECIPIENT_EMAIL }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -100,66 +96,6 @@ jobs:
           echo "Resolved run mode: $MODE"
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
-      # -----------------------------------------------------------------
-      # Restore the persisted Instagram session from the IG_SESSION_B64
-      # secret. session_manager.default_session_path() expects
-      # "<IG_SESSION_DIR>/<IG_USERNAME>.session" (IG_SESSION_DIR defaults
-      # to "./session"), so that's exactly the path decoded to here.
-      # Skipped for the report step, which never touches Instagram.
-      # -----------------------------------------------------------------
-      - name: Restore Instagram session
-        if: steps.mode.outputs.mode == 'run1' || steps.mode.outputs.mode == 'run2'
-        run: |
-          mkdir -p session
-          echo "${{ secrets.IG_SESSION_B64 }}" | base64 -d > "session/${IG_USERNAME}.session"
-          ls -la session/
-
-      # -----------------------------------------------------------------
-      # Validate the restored session via session_manager's own real
-      # validation (test_login() after load_session_from_file(), per
-      # session_manager.load_saved_session) rather than re-implementing any
-      # check. On failure: notify Telegram directly through the real
-      # notifier.send_telegram_message() function (not a hand-rolled curl
-      # call to the Bot API), then exit non-zero so the job is marked
-      # failed -- a genuine failure state, not something to swallow.
-      # -----------------------------------------------------------------
-      - name: Validate Instagram session
-        if: steps.mode.outputs.mode == 'run1' || steps.mode.outputs.mode == 'run2'
-        run: |
-          python - <<'PY'
-          import os
-          import sys
-          import notifier
-          import session_manager
-
-          FAILURE_MESSAGE = (
-              "Instagram session invalid or missing — re-run the local "
-              "one-time login and update the IG_SESSION_B64 secret"
-          )
-
-          def alert_and_exit(exc):
-              print(f"::error::{FAILURE_MESSAGE} (detail: {exc})")
-              token = os.environ.get("TELEGRAM_BOT_TOKEN")
-              chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-              if token and chat_id:
-                  notifier.send_telegram_message(token, chat_id, FAILURE_MESSAGE)
-              else:
-                  print("::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; failure alert not sent.")
-              sys.exit(1)
-
-          try:
-              session_manager.ensure_session()
-              print("Instagram session is valid.")
-          except (
-              session_manager.SessionInvalidError,
-              session_manager.ChallengeRequiredError,
-              session_manager.SessionManagerError,
-          ) as exc:
-              alert_and_exit(exc)
-          except Exception as exc:  # noqa: BLE001 - any other decode/load failure is the same operator action
-              alert_and_exit(exc)
-          PY
-
       - name: Run orchestrator (research run)
         if: steps.mode.outputs.mode == 'run1' || steps.mode.outputs.mode == 'run2'
         run: python orchestrator.py --run ${{ steps.mode.outputs.mode }}
@@ -172,10 +108,9 @@ jobs:
       # Upload this run's CSV as a workflow artifact (Architecture.md §5:
       # chosen over committing CSVs to the repo, to keep the public repo's
       # git history free of scraped business data). `if: always()` so a
-      # failed session-validation step (job already marked failed above)
-      # still gets whatever partial output exists uploaded/attempted rather
-      # than silently skipped; if-no-files-found: ignore covers report runs
-      # (no new CSV) and halted runs (no CSV written at all).
+      # failed research-run step still gets whatever partial output exists
+      # uploaded/attempted rather than silently skipped; if-no-files-found:
+      # ignore covers report runs (no new CSV).
       # -----------------------------------------------------------------
       - name: Upload CSV artifact
         if: always()
@@ -189,9 +124,9 @@ jobs:
       # Trivial bot-identity commit to keep the repo "active" so GitHub
       # doesn't auto-disable this scheduled workflow after 60 days of no
       # repo activity (Architecture.md §5). ONLY last_run.txt — never the
-      # CSV/lead data. `if: always()` is deliberate: even a failed
-      # (session-invalid) run still records that it ran, which is exactly
-      # the repo activity needed to avoid the 60-day disable — see
+      # CSV/lead data. `if: always()` is deliberate: even a failed run
+      # still records that it ran, which is exactly the repo activity
+      # needed to avoid the 60-day disable — see
       # README.md's "60-day inactivity rule" section for the one scenario
       # this still doesn't cover (the workflow itself stops running
       # entirely, e.g. disabled by a human, or GitHub-side outages).
