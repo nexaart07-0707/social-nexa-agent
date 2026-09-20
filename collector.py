@@ -105,10 +105,22 @@ def _empty_result(handle: str, error: str | None = None) -> dict[str, Any]:
     return result
 
 
-def _with_backoff(func, max_retries: int = 4, base_delay: float = 5.0):
+def _with_backoff(func, max_retries: int = 2, base_delay: float = 3.0):
     """
     Run func() with exponential backoff on rate-limit / connection errors.
     Re-raises the last exception (or any non-retryable one) to the caller.
+
+    ponytail: tuned down from (max_retries=4, base_delay=5.0) after a live
+    53-minute run had to be cancelled. Since login was removed, EVERY
+    candidate hits Instagram anonymously, and anonymous access gets
+    rate-limited (401/429) quickly and consistently -- not as an occasional
+    blip but systemically. The old defaults meant up to ~50s of backoff
+    sleep per _with_backoff call (collect_profile makes up to two such
+    calls per handle: one for the profile, one for get_posts), multiplied
+    across every candidate in a run. (2, 3.0) still retries a genuine
+    transient blip once, but gives up on a sustained rate-limit in ~6s
+    instead of ~50s. Upgrade path: make these env-configurable if
+    unauthenticated rate-limiting patterns change.
     """
     for attempt in range(max_retries):
         try:

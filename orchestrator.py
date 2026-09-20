@@ -80,6 +80,18 @@ logger = logging.getLogger("orchestrator")
 # discovery.py's NICHE_OSM_TAGS keys (both enumerate the same six niches).
 ALL_SIX_NICHES: tuple[str, ...] = analyzer.NICHE_KEYS
 
+# ponytail: fixed cap, not a dynamic min/max-driven size (scheduler_rules.
+# check_min_max() exists but is not wired into orchestrator.py at all). A
+# live run without any cap passed dozens of dedup'd candidates straight into
+# collector.collect_many() and ran 53+ minutes before being cancelled.
+# PRD.md §5 only needs 2-3 qualifying results per run, so 20 raw candidates
+# is generous headroom. discover_for_run() concatenates Hubli candidates
+# BEFORE nationwide ones and slices with result[:max_results] at the very
+# end, so a cap this size still preserves Hubli's share of run1's results.
+# Upgrade path: size this from scheduler_rules.check_min_max() instead of a
+# constant, if/when dynamic sizing is actually needed.
+MAX_CANDIDATES_PER_RUN = 20
+
 
 def _determine_run(run_override: str | None) -> str | None:
     """CLI/function override wins; otherwise auto-detect from current IST time."""
@@ -158,7 +170,9 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
               f"{len(candidates)} synthetic candidate(s).")
     else:
         try:
-            candidates = discovery.discover_for_run(determined_run, niches=list(ALL_SIX_NICHES))
+            candidates = discovery.discover_for_run(
+                determined_run, niches=list(ALL_SIX_NICHES), max_results=MAX_CANDIDATES_PER_RUN
+            )
         except Exception as exc:  # noqa: BLE001 - failure isolation, per Architecture.md §6
             logger.exception("discovery.discover_for_run failed; continuing with zero candidates.")
             errors.append(f"discovery failed: {exc}")

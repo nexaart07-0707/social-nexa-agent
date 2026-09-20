@@ -239,6 +239,18 @@ def test_with_backoff_retries_then_succeeds(monkeypatch):
     assert calls["n"] == 3
 
 
+def test_with_backoff_defaults_tuned_down_for_unauthenticated_access():
+    """Guards against silently reverting the post-incident tuning: anonymous
+    (login-removed) Instagram access gets rate-limited systemically, so
+    defaults must stay lower than the old (4, 5.0) that produced a 53-minute
+    run."""
+    import inspect
+
+    sig = inspect.signature(collector._with_backoff)
+    assert sig.parameters["max_retries"].default == 2
+    assert sig.parameters["base_delay"].default == 3.0
+
+
 def test_with_backoff_gives_up_after_max_retries(monkeypatch):
     monkeypatch.setattr(collector.time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(collector.random, "uniform", lambda a, b: 0)

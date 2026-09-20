@@ -80,6 +80,24 @@ def test_no_active_window_exits_early_without_calling_anything_else():
 # ---------------------------------------------------------------------------
 
 
+def test_discovery_is_called_with_candidate_cap():
+    """A live manually-triggered run hung 53+ minutes because discover_for_run()
+    was called with no max_results, so every dedup'd candidate (dozens) went
+    into collect_many(). orchestrator.run() must always pass the module-level
+    cap through."""
+    with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.discovery.discover_for_run", return_value=[]) as mock_discovery, \
+         patch("orchestrator.collector.collect_many") as mock_collect, \
+         patch("orchestrator.storage.write_leads_csv", return_value="output/leads_x.csv"), \
+         patch("orchestrator.notifier.send_daily_email_report", return_value=False):
+        orchestrator.run(run_name="run1", dry_run=False)
+
+    mock_discovery.assert_called_once_with(
+        "run1", niches=list(orchestrator.ALL_SIX_NICHES), max_results=orchestrator.MAX_CANDIDATES_PER_RUN
+    )
+    assert orchestrator.MAX_CANDIDATES_PER_RUN == 20
+
+
 def test_discovery_failure_continues_with_empty_candidates():
     with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
          patch("orchestrator.discovery.discover_for_run", side_effect=RuntimeError("nominatim down")), \
