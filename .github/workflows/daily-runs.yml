@@ -52,6 +52,7 @@ on:
 
 permissions:
   contents: write  # needed for the last_run.txt bot-identity commit at the end
+  actions: read    # needed for the report step to list/download today's run1/run2 artifacts
 
 jobs:
   run:
@@ -99,6 +100,56 @@ jobs:
       - name: Run orchestrator (research run)
         if: steps.mode.outputs.mode == 'run1' || steps.mode.outputs.mode == 'run2'
         run: python orchestrator.py --run ${{ steps.mode.outputs.mode }}
+
+      # -----------------------------------------------------------------
+      # The report step reads back today's run1/run2 CSVs via
+      # orchestrator.py's find_todays_run_csvs(), but each trigger runs on
+      # a completely separate, fresh runner -- run1/run2's CSVs only ever
+      # existed on THEIR OWN runner's temporary disk and were uploaded as
+      # artifacts (never committed to the repo, per Architecture.md's
+      # decision to keep scraped business data out of public git history).
+      # Found live: without this step, `report` always saw an empty
+      # output/ dir and sent an inaccurate "0 qualifying results" email
+      # even on a day with real results. Fetch today's real
+      # leads-csv-<run_id> artifacts via the API (using the workflow's own
+      # built-in token -- no extra secret needed) before running --report.
+      # -----------------------------------------------------------------
+      - name: Find and download today's CSV artifacts
+        if: steps.mode.outputs.mode == 'report'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const today = new Date().toISOString().slice(0, 10);
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo, { owner, repo, per_page: 100 }
+            );
+            const todays = artifacts.filter(
+              a => a.name.startsWith('leads-csv-') && !a.expired && a.created_at.slice(0, 10) === today
+            );
+            fs.mkdirSync('artifact_downloads', { recursive: true });
+            for (const artifact of todays) {
+              const zip = await github.rest.actions.downloadArtifact({
+                owner, repo, artifact_id: artifact.id, archive_format: 'zip',
+              });
+              fs.writeFileSync(`artifact_downloads/${artifact.id}.zip`, Buffer.from(zip.data));
+            }
+            console.log(`Found ${todays.length} artifact(s) for ${today}: ` + todays.map(a => a.name).join(', '));
+
+      - name: Extract today's CSV artifacts into output/
+        if: steps.mode.outputs.mode == 'report'
+        run: |
+          mkdir -p output extracted
+          if [ -d artifact_downloads ]; then
+            for z in artifact_downloads/*.zip; do
+              [ -e "$z" ] || continue
+              unzip -o "$z" -d extracted/
+            done
+          fi
+          find extracted -name '*.csv' -exec cp {} output/ \; 2>/dev/null || true
+          echo "output/ now contains:"
+          ls -la output/ || true
 
       - name: Run daily email report
         if: steps.mode.outputs.mode == 'report'
