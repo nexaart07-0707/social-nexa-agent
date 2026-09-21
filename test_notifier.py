@@ -147,6 +147,30 @@ def test_send_daily_email_report_success_uses_correct_smtp_calls(monkeypatch):
     assert "2026-09-19" in sent_message["Subject"]
 
 
+def test_send_daily_email_report_empty_string_env_vars_use_default(monkeypatch):
+    # Regression test: GitHub Actions' workflow env: block sets a var to an
+    # EMPTY STRING (not unset) when the referenced secret doesn't exist.
+    # os.environ.get(key, default) only falls back on a missing key, so this
+    # silently sent login('', password) for every real run until fixed.
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "app-password-123")
+    monkeypatch.setenv("GMAIL_SENDER_EMAIL", "")
+    monkeypatch.setenv("GMAIL_RECIPIENT_EMAIL", "")
+
+    mock_server = MagicMock()
+    mock_smtp_cm = MagicMock()
+    mock_smtp_cm.__enter__.return_value = mock_server
+    mock_smtp_cm.__exit__.return_value = False
+
+    with patch("notifier.smtplib.SMTP", return_value=mock_smtp_cm):
+        result = send_daily_email_report("run1", [SAMPLE_RECORD_HIGH_GAP], date(2026, 9, 19))
+
+    assert result is True
+    mock_server.login.assert_called_once_with("nexaart07@gmail.com", "app-password-123")
+    sent_message = mock_server.send_message.call_args[0][0]
+    assert sent_message["From"] == "nexaart07@gmail.com"
+    assert sent_message["To"] == "nexaart07@gmail.com"
+
+
 def test_send_daily_email_report_zero_results_still_sends(monkeypatch):
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "app-password-123")
 

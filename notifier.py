@@ -240,8 +240,15 @@ def send_daily_email_report(
     now (Telegram was removed) so there is no fallback channel to send to --
     a send failure is only ever surfaced via the GitHub Actions log.
     """
-    sender = os.environ.get("GMAIL_SENDER_EMAIL", _DEFAULT_GMAIL_ACCOUNT)
-    recipient = os.environ.get("GMAIL_RECIPIENT_EMAIL", _DEFAULT_GMAIL_ACCOUNT)
+    # ponytail: GitHub Actions' workflow env: block sets these vars to an
+    # EMPTY STRING (not unset) when the referenced secret doesn't exist --
+    # os.environ.get(key, default) only falls back on a missing key, not an
+    # empty value, so `or` is required here to actually apply the default.
+    # Found live: every GMAIL_APP_PASSWORD rotation kept failing with a Gmail
+    # auth error because sender was silently resolving to '' (login with a
+    # blank username), not because any password was ever actually wrong.
+    sender = os.environ.get("GMAIL_SENDER_EMAIL") or _DEFAULT_GMAIL_ACCOUNT
+    recipient = os.environ.get("GMAIL_RECIPIENT_EMAIL") or _DEFAULT_GMAIL_ACCOUNT
     app_password = os.environ.get("GMAIL_APP_PASSWORD")
 
     subject = build_report_subject(run, run_date)
