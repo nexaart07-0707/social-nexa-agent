@@ -124,6 +124,34 @@ exploration/robustness is warranted. Anyone continuing development on this
 codebase should read `docs/Workflow.md` for the full manager/worker process
 this project follows before making structural changes.
 
+## Pre-scoring filter data files
+
+Two files under `data/` back the pre-scoring exclusion rules that run
+between collection and scoring (see `docs/Architecture.md` §1/§2 and
+`filters.py`/`dedup.py`). Both are committed to the repo (`.gitignore`
+deliberately does not ignore `/data/`) — neither is scraped lead data.
+
+- **`data/brand_blocklist.json`** — a flat JSON array of known major
+  chain/franchise brand names (e.g. Starbucks, McDonald's, Domino's).
+  Candidates whose handle or business name contains one of these are
+  excluded before scoring, since they're not local businesses needing
+  outreach. **To add more excluded brands:** open the file, add a new
+  lowercase string to the array (a genuine, distinctive brand name — never
+  a bare generic word like "cafe" or "salon", which would match far too
+  broadly), then commit and push:
+  ```bash
+  git add data/brand_blocklist.json
+  git commit -m "Add <brand> to the blocklist"
+  git push
+  ```
+- **`data/sent_accounts_history.json`** — persistent record of every
+  handle that has already appeared in a successfully-sent daily email
+  report, so the same lead isn't re-sent run after run. Written
+  automatically by `dedup.update_sent_history()`, and committed/pushed
+  automatically by the GitHub Actions workflow's "Record last run
+  timestamp" step (same bot-identity commit as `last_run.txt`) — nothing
+  to do here manually.
+
 ## Known limitations
 
 - **`handle_guess` is not a verified Instagram handle.** `discovery.py`

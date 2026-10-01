@@ -11,4 +11,10 @@ venv/
 
 # Output data (Modules 2/3/5)
 /output/
-/data/
+
+# NOTE: /data/ is intentionally NOT ignored -- it holds data/brand_blocklist.json
+# (a committed seed config file, manually edited to add more excluded brands)
+# and data/sent_accounts_history.json (Rule 4's persistent dedup history,
+# committed by .github/workflows/daily-runs.yml's "Record last run
+# timestamp" step, same bot-identity pattern as last_run.txt). Neither is
+# scraped lead data -- that stays in /output/, ignored above.

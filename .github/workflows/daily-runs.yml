@@ -174,15 +174,25 @@ jobs:
       # -----------------------------------------------------------------
       # Trivial bot-identity commit to keep the repo "active" so GitHub
       # doesn't auto-disable this scheduled workflow after 60 days of no
-      # repo activity (Architecture.md §5). ONLY last_run.txt — never the
-      # CSV/lead data. `if: always()` is deliberate: even a failed run
-      # still records that it ran, which is exactly the repo activity
-      # needed to avoid the 60-day disable — see
-      # README.md's "60-day inactivity rule" section for the one scenario
-      # this still doesn't cover (the workflow itself stops running
-      # entirely, e.g. disabled by a human, or GitHub-side outages).
-      # `git diff --quiet || git commit ...` guards against "nothing to
-      # commit" (same mode run twice in one UTC minute) failing the job.
+      # repo activity (Architecture.md §5). last_run.txt — never the
+      # CSV/lead data — PLUS data/sent_accounts_history.json (Rule 4's
+      # persistent already-sent dedup history, if it exists/changed this
+      # run: orchestrator.py's Python code only ever WRITES that file
+      # locally, same architecture boundary as last_run.txt; this step is
+      # what actually commits/pushes it so the next run sees it). Both
+      # files are committed together in the SAME commit — no second commit
+      # step. `if: always()` is deliberate: even a failed run still records
+      # that it ran, which is exactly the repo activity needed to avoid the
+      # 60-day disable — see README.md's "60-day inactivity rule" section
+      # for the one scenario this still doesn't cover (the workflow itself
+      # stops running entirely, e.g. disabled by a human, or GitHub-side
+      # outages). `git diff --cached --quiet || git commit ...` guards
+      # against "nothing to commit" (same mode run twice in one UTC
+      # minute, or a run that never wrote the history file) failing the
+      # job. `[ -f ... ] && git add ...` guards the history file's `git
+      # add` since the file may not exist yet (first-ever run, or a run
+      # with zero newly-sent accounts) -- `git add` on a nonexistent path
+      # errors, so this only adds it when present.
       # -----------------------------------------------------------------
       - name: Record last run timestamp
         if: always()
@@ -192,9 +202,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add last_run.txt
+          [ -f data/sent_accounts_history.json ] && git add data/sent_accounts_history.json
           if git diff --cached --quiet; then
-            echo "last_run.txt unchanged; nothing to commit."
+            echo "last_run.txt/sent_accounts_history.json unchanged; nothing to commit."
           else
-            git commit -m "chore: update last_run.txt [skip ci]"
+            git commit -m "chore: update last_run.txt and sent-accounts history [skip ci]"
             git push
           fi

@@ -8,12 +8,18 @@ themselves (each module has its own passing test suite already).
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date as _date
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import analyzer
+import dedup as dedup_module
+import filters as filters_module
+import notifier
 import orchestrator
+import storage
 
 
 IST_RUN1_TIME = datetime(2026, 9, 19, 14, 0, 0, tzinfo=timezone.utc)  # arbitrary tz-aware dt
@@ -86,6 +92,7 @@ def test_discovery_is_called_with_candidate_cap():
     into collect_many(). orchestrator.run() must always pass the module-level
     cap through."""
     with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.dedup.load_sent_history", return_value={}), \
          patch("orchestrator.discovery.discover_for_run", return_value=[]) as mock_discovery, \
          patch("orchestrator.collector.collect_many") as mock_collect, \
          patch("orchestrator.storage.write_leads_csv", return_value="output/leads_x.csv"), \
@@ -100,6 +107,7 @@ def test_discovery_is_called_with_candidate_cap():
 
 def test_discovery_failure_continues_with_empty_candidates():
     with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.dedup.load_sent_history", return_value={}), \
          patch("orchestrator.discovery.discover_for_run", side_effect=RuntimeError("nominatim down")), \
          patch("orchestrator.collector.collect_many") as mock_collect, \
          patch("orchestrator.storage.write_leads_csv", return_value="output/leads_x.csv") as mock_storage, \
@@ -142,6 +150,8 @@ def test_happy_path_calls_every_step_in_order_and_builds_summary():
         return _inner
 
     with patch("orchestrator.collector.get_anonymous_loader", side_effect=track("loader")), \
+         patch("orchestrator.dedup.load_sent_history", return_value={}), \
+         patch("orchestrator.dedup.update_sent_history"), \
          patch("orchestrator.discovery.discover_for_run", side_effect=lambda *a, **k: (track("discovery")(), candidates)[1]), \
          patch("orchestrator.collector.collect_many", side_effect=lambda *a, **k: (track("collect")(), records)[1]), \
          patch("orchestrator.analyzer.analyze", side_effect=lambda rec, niche, **k: (track("analyze")(), analyzed[[r["handle"] for r in records].index(rec["handle"])])[1]), \
@@ -183,6 +193,8 @@ def test_successful_run_emails_its_own_report_with_run_records_and_todays_ist_da
     fixed_date = _date(2026, 9, 20)
 
     with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.dedup.load_sent_history", return_value={}), \
+         patch("orchestrator.dedup.update_sent_history"), \
          patch("orchestrator.discovery.discover_for_run", return_value=candidates), \
          patch("orchestrator.collector.collect_many", return_value=records), \
          patch("orchestrator.analyzer.analyze", return_value=analyzed[0]), \
@@ -214,6 +226,7 @@ def test_one_bad_record_does_not_stop_others_from_being_scored():
                 "data_quality": {}}
 
     with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.dedup.load_sent_history", return_value={}), \
          patch("orchestrator.discovery.discover_for_run", return_value=candidates), \
          patch("orchestrator.collector.collect_many", return_value=records), \
          patch("orchestrator.analyzer.analyze", side_effect=fake_analyze), \
@@ -351,3 +364,243 @@ def test_cli_report_flag_invokes_run_report_and_exits_zero():
     mock_report.assert_called_once()
     mock_run.assert_not_called()
     assert exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# (h) Pre-scoring filter chain (filters.py Rules 1-3 + dedup.py Rule 4),
+#     wired into orchestrator.run() between Step 4 (collection) and Step 5
+#     (scoring). These tests use the REAL filters/dedup modules (pure
+#     functions) and only mock the external-service calls (discovery,
+#     collection, email) -- the point is to prove orchestrator.py's wiring,
+#     not re-test filters.py/dedup.py's own logic (see test_filters.py /
+#     test_dedup.py for that).
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_filter_chain_excludes_blocklisted_candidate_before_scoring():
+    """A candidate whose handle matches a real brand_blocklist.json entry
+    must be fully excluded: analyzer.analyze() is never called for it, and
+    it never reaches storage.write_leads_csv() or
+    notifier.send_daily_email_report()'s input list."""
+    good_candidate = _candidate("goodhandle", "cafes/bakeries/home-food")
+    blocklisted_candidate = _candidate("dominospizzaindia", "restaurants")
+    candidates = [good_candidate, blocklisted_candidate]
+    records = [_record("goodhandle"), _record("dominospizzaindia")]
+
+    analyzed_calls = []
+
+    def fake_analyze(record, niche, **kwargs):
+        analyzed_calls.append(record["handle"])
+        return {"handle": record["handle"], "niche": niche, "category_scores": {},
+                "total_score": 1, "flags": [], "manual_review": [], "profile_metrics": {},
+                "data_quality": {}}
+
+    with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.dedup.load_sent_history", return_value={}), \
+         patch("orchestrator.discovery.discover_for_run", return_value=candidates), \
+         patch("orchestrator.collector.collect_many", return_value=records), \
+         patch("orchestrator.analyzer.analyze", side_effect=fake_analyze), \
+         patch("orchestrator.storage.write_leads_csv", return_value="output/leads_f.csv") as mock_storage, \
+         patch("orchestrator.notifier.send_daily_email_report", return_value=False) as mock_notify:
+        orchestrator.run(run_name="run1", dry_run=False)
+
+    assert analyzed_calls == ["goodhandle"]
+
+    storage_rows = mock_storage.call_args.args[0]
+    scored_handles = [pair[1]["handle"] for pair in storage_rows]
+    assert scored_handles == ["goodhandle"]
+    assert "dominospizzaindia" not in scored_handles
+
+    notify_records = mock_notify.call_args.args[1]
+    assert [r["handle"] for r in notify_records] == ["goodhandle"]
+
+
+def test_orchestrator_filter_chain_excludes_already_sent_handle():
+    """A candidate whose handle is already in the loaded sent-history is
+    excluded, never reaching analyzer.analyze()."""
+    candidates = [_candidate("freshhandle", "restaurants"), _candidate("oldhandle", "restaurants")]
+    records = [_record("freshhandle"), _record("oldhandle")]
+    history = {"oldhandle": {"first_sent_date": "2026-09-01", "run": "run1"}}
+
+    analyzed_calls = []
+
+    def fake_analyze(record, niche, **kwargs):
+        analyzed_calls.append(record["handle"])
+        return {"handle": record["handle"], "niche": niche, "category_scores": {},
+                "total_score": 1, "flags": [], "manual_review": [], "profile_metrics": {},
+                "data_quality": {}}
+
+    with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.dedup.load_sent_history", return_value=history), \
+         patch("orchestrator.discovery.discover_for_run", return_value=candidates), \
+         patch("orchestrator.collector.collect_many", return_value=records), \
+         patch("orchestrator.analyzer.analyze", side_effect=fake_analyze), \
+         patch("orchestrator.storage.write_leads_csv", return_value="output/leads_g.csv"), \
+         patch("orchestrator.notifier.send_daily_email_report", return_value=False):
+        orchestrator.run(run_name="run1", dry_run=False)
+
+    assert analyzed_calls == ["freshhandle"]
+
+
+def test_orchestrator_calls_update_sent_history_only_when_email_confirmed_sent():
+    """update_sent_history() must only run after send_daily_email_report()
+    returns True -- a failed send must not mark anything 'already sent'."""
+    candidates = [_candidate("handleone", "cafes/bakeries/home-food")]
+    records = [_record("handleone")]
+    analyzed = {"handle": "handleone", "niche": "cafes/bakeries/home-food", "category_scores": {},
+                "total_score": 5, "flags": [], "manual_review": [], "profile_metrics": {}, "data_quality": {}}
+    fixed_date = _date(2026, 9, 20)
+
+    with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.dedup.load_sent_history", return_value={}), \
+         patch("orchestrator.dedup.update_sent_history") as mock_update, \
+         patch("orchestrator.discovery.discover_for_run", return_value=candidates), \
+         patch("orchestrator.collector.collect_many", return_value=records), \
+         patch("orchestrator.analyzer.analyze", return_value=analyzed), \
+         patch("orchestrator.storage.write_leads_csv", return_value="output/leads_h.csv"), \
+         patch("orchestrator.scheduler_rules.now_ist", return_value=datetime(2026, 9, 20, 13, 30, tzinfo=timezone.utc)), \
+         patch("orchestrator.notifier.send_daily_email_report", return_value=True):
+        orchestrator.run(run_name="run1", dry_run=False)
+
+    mock_update.assert_called_once_with({}, [analyzed], "run1", fixed_date)
+
+
+def test_orchestrator_does_not_call_update_sent_history_when_email_send_fails():
+    candidates = [_candidate("handleone", "cafes/bakeries/home-food")]
+    records = [_record("handleone")]
+    analyzed = {"handle": "handleone", "niche": "cafes/bakeries/home-food", "category_scores": {},
+                "total_score": 5, "flags": [], "manual_review": [], "profile_metrics": {}, "data_quality": {}}
+
+    with patch("orchestrator.collector.get_anonymous_loader", return_value=object()), \
+         patch("orchestrator.dedup.load_sent_history", return_value={}), \
+         patch("orchestrator.dedup.update_sent_history") as mock_update, \
+         patch("orchestrator.discovery.discover_for_run", return_value=candidates), \
+         patch("orchestrator.collector.collect_many", return_value=records), \
+         patch("orchestrator.analyzer.analyze", return_value=analyzed), \
+         patch("orchestrator.storage.write_leads_csv", return_value="output/leads_i.csv"), \
+         patch("orchestrator.notifier.send_daily_email_report", return_value=False):
+        orchestrator.run(run_name="run1", dry_run=False)
+
+    mock_update.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# (i) DoD case 8: a record that passes all 4 filters + scoring appears in
+#     the final output, AND after update_sent_history() it appears in the
+#     returned/written history.
+# ---------------------------------------------------------------------------
+
+
+def test_record_passing_all_filters_appears_in_output_then_in_updated_history(tmp_path):
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    candidate = _candidate("survivor1", "restaurants")
+    candidate["name"] = "Survivor Restaurant"
+    record = {
+        "handle": "survivor1", "bio": "unavailable", "follower_count": 300, "following_count": 50,
+        "posts": [
+            {"date": (now - timedelta(days=2)).isoformat(), "likes": 5, "comments": 1, "media_type": "image"},
+            {"date": (now - timedelta(days=10)).isoformat(), "likes": 4, "comments": 0, "media_type": "video"},
+        ],
+        "highlight_count": 0, "video_count": 1, "image_count": 1,
+    }
+    history = {}
+
+    # passes all 4 filters
+    assert filters_module.filter_by_brand_blocklist(record, business_name=candidate["name"]) is True
+    assert dedup_module.filter_already_sent([record], history) == [record]
+    assert filters_module.filter_by_follower_cap(record) is True
+    assert filters_module.filter_by_posting_frequency(record, now=now) is True
+
+    analyzed = analyzer.analyze(record, candidate["niche"], now=now)
+    csv_path = storage.write_leads_csv([(candidate, analyzed)], output_dir=str(tmp_path / "output"), now=now)
+    with open(csv_path, encoding="utf-8") as f:
+        csv_content = f.read()
+    assert "survivor1" in csv_content
+
+    history_path = str(tmp_path / "data" / "sent_accounts_history.json")
+    merged = dedup_module.update_sent_history(history, [analyzed], "run1", now.date(), path=history_path)
+    assert merged["survivor1"] == {"first_sent_date": "2026-10-01", "run": "run1"}
+
+    with open(history_path, encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk["survivor1"]["run"] == "run1"
+
+
+# ---------------------------------------------------------------------------
+# (j) DoD case 9: full filter chain + storage.write_leads_csv +
+#     notifier.build_report_html -- excluded candidates/handles/names must
+#     be NOWHERE in either output, not just unscored.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_chain_integration_excludes_fully_absent_from_csv_and_html(tmp_path):
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    def _posts(*days_ago):
+        return [
+            {"date": (now - timedelta(days=d)).isoformat(), "likes": 3, "comments": 1, "media_type": "image"}
+            for d in days_ago
+        ]
+
+    good_candidate = _candidate("goodhandle", "cafes/bakeries/home-food")
+    good_candidate["name"] = "Good Cafe"
+    good_record = {
+        "handle": "goodhandle", "bio": "Fresh coffee. DM to order!", "follower_count": 500,
+        "following_count": 100, "posts": _posts(5, 20), "highlight_count": 1, "video_count": 1, "image_count": 1,
+    }
+
+    blocklisted_candidate = _candidate("starbucksindia", "cafes/bakeries/home-food")
+    blocklisted_candidate["name"] = "Starbucks India"
+    blocklisted_record = {**good_record, "handle": "starbucksindia"}
+
+    over_cap_candidate = _candidate("bigbrandhandle", "restaurants")
+    over_cap_candidate["name"] = "Big Brand Eatery"
+    over_cap_record = {**good_record, "handle": "bigbrandhandle", "follower_count": 50000}
+
+    stale_candidate = _candidate("stalehandle", "salons/spas/beauty")
+    stale_candidate["name"] = "Stale Salon"
+    stale_record = {**good_record, "handle": "stalehandle", "posts": _posts(100)}
+
+    already_sent_candidate = _candidate("sentbefore", "boutiques/clothing/jewelry")
+    already_sent_candidate["name"] = "Sent Before Boutique"
+    already_sent_record = {**good_record, "handle": "sentbefore"}
+
+    candidates = [good_candidate, blocklisted_candidate, over_cap_candidate, stale_candidate, already_sent_candidate]
+    records = [good_record, blocklisted_record, over_cap_record, stale_record, already_sent_record]
+    history = {"sentbefore": {"first_sent_date": "2026-09-01", "run": "run1"}}
+
+    # Replicate orchestrator.run()'s real filter-chain ordering using the
+    # real filters.py/dedup.py functions (no reimplementation of the rules).
+    survivors = []
+    for candidate, record in zip(candidates, records):
+        if not filters_module.filter_by_brand_blocklist(record, business_name=candidate["name"]):
+            continue
+        if not dedup_module.filter_already_sent([record], history):
+            continue
+        if not filters_module.filter_by_follower_cap(record):
+            continue
+        if not filters_module.filter_by_posting_frequency(record, now=now):
+            continue
+        survivors.append((candidate, record))
+
+    assert [c["handle_guess"] for c, _r in survivors] == ["goodhandle"]
+
+    scored_pairs = [(c, analyzer.analyze(r, c["niche"], now=now)) for c, r in survivors]
+
+    csv_path = storage.write_leads_csv(scored_pairs, output_dir=str(tmp_path / "output"), now=now)
+    with open(csv_path, encoding="utf-8") as f:
+        csv_content = f.read()
+
+    flat_records = [storage.flatten_record(a, c) for c, a in scored_pairs]
+    html = notifier.build_report_html("run1", flat_records, now.date())
+
+    for excluded_handle in ("starbucksindia", "bigbrandhandle", "stalehandle", "sentbefore"):
+        assert excluded_handle not in csv_content
+        assert excluded_handle not in html
+    for excluded_name in ("Starbucks India", "Big Brand Eatery", "Stale Salon", "Sent Before Boutique"):
+        assert excluded_name not in csv_content
+        assert excluded_name not in html
+
+    assert "goodhandle" in csv_content
+    assert "Good Cafe" in csv_content
+    assert "goodhandle" in html

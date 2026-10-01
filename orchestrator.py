@@ -49,6 +49,20 @@ no session file, no login, no session-failure halt mode. Email (notifier.py)
 is the sole notification channel; Telegram has been removed. Each run1/run2
 pass sends its own email report immediately on completion (see Step 6/6
 below), in addition to the 8PM consolidated report via run_report().
+
+ARCHITECTURE NOTE (filter chain): between Step 4 (collection) and Step 5
+(scoring), every (candidate, record) pair now passes through a 4-rule
+pre-scoring filter chain -- cheapest/no-collected-data-needed rules first:
+Rule 3 brand blocklist (filters.filter_by_brand_blocklist) -> Rule 4
+already-sent dedup (dedup.filter_already_sent, against
+data/sent_accounts_history.json) -> Rule 1 follower cap
+(filters.filter_by_follower_cap, >15000 excluded) -> Rule 2 posting
+frequency (filters.filter_by_posting_frequency, <2 posts/30 days excluded).
+A pair failing any rule is fully excluded -- never scored, never written to
+CSV, never emailed. Only survivors reach analyzer.analyze() in Step 5. After
+Step 6b's email send is confirmed True, dedup.update_sent_history() persists
+the newly-sent handles locally; the workflow YAML (not this file) is what
+commits/pushes that file, same as last_run.txt.
 --------------------------------------------------------------------------
 """
 
@@ -64,7 +78,9 @@ from typing import Any
 
 import analyzer
 import collector
+import dedup
 import discovery
+import filters
 import notifier
 import scheduler_rules
 import storage
@@ -153,6 +169,13 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
         }
     print(f"[orchestrator] Step 1/6: run window = {determined_run}")
 
+    # ---- Step 1b: load persistent already-sent history (Rule 4) -----------
+    # Local file read only -- cheap and safe to do for real even in
+    # dry-run (it never touches Instagram/Nominatim/email), so dry-run
+    # exercises the real filter chain too instead of skipping it.
+    sent_history = dedup.load_sent_history()
+    print(f"[orchestrator] Step 1b/6: loaded {len(sent_history)} already-sent handle(s) from history.")
+
     # ---- Step 2: build the (anonymous) Instagram loader ---------------------
     if dry_run:
         print("[orchestrator] Step 2/6: collector.get_anonymous_loader() -- FAKED (dry-run), "
@@ -200,12 +223,53 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
     else:
         print("[orchestrator] Step 4/6: skipped (no candidates to collect).")
 
+    # ---- Step 4b: pre-scoring filter chain ---------------------------------
+    # Order (cheapest/no-collected-data-needed first): Rule 3 brand blocklist
+    # -> Rule 4 already-sent dedup -> Rule 1 follower cap -> Rule 2 posting
+    # frequency. A pair failing ANY rule is fully excluded here -- it never
+    # reaches analyzer.analyze(), storage.write_leads_csv(), or
+    # notifier.send_daily_email_report()'s input list.
+    pairs = list(zip(candidates, records))
+
+    stage_blocklist = [
+        (c, r) for c, r in pairs
+        if filters.filter_by_brand_blocklist(r, business_name=c.get("name"))
+    ]
+    blocklist_excluded = len(pairs) - len(stage_blocklist)
+
+    # dedup.filter_already_sent() is designed to take a batch of records;
+    # use it as such, then match back to (candidate, record) pairs by
+    # object identity (not by handle value) so this stays correct even if
+    # two records happened to share a handle value (e.g. both "unavailable").
+    stage_blocklist_records = [r for _c, r in stage_blocklist]
+    surviving_records = dedup.filter_already_sent(stage_blocklist_records, sent_history)
+    surviving_ids = {id(r) for r in surviving_records}
+    stage_dedup = [(c, r) for c, r in stage_blocklist if id(r) in surviving_ids]
+    dedup_excluded = len(stage_blocklist) - len(stage_dedup)
+
+    stage_follower = [(c, r) for c, r in stage_dedup if filters.filter_by_follower_cap(r)]
+    follower_excluded = len(stage_dedup) - len(stage_follower)
+
+    survivors = [(c, r) for c, r in stage_follower if filters.filter_by_posting_frequency(r)]
+    posting_excluded = len(stage_follower) - len(survivors)
+
+    logger.info(
+        "Filter chain: excluded %d by brand blocklist, %d by dedup, %d by follower cap, "
+        "%d by posting frequency; %d of %d pair(s) survived.",
+        blocklist_excluded, dedup_excluded, follower_excluded, posting_excluded,
+        len(survivors), len(pairs),
+    )
+    print(
+        f"[orchestrator] Step 4b/6: filter chain -> {len(survivors)}/{len(pairs)} pair(s) survived "
+        f"(excluded: blocklist={blocklist_excluded}, dedup={dedup_excluded}, "
+        f"follower_cap={follower_excluded}, posting_frequency={posting_excluded})."
+    )
+
     # ---- Step 5: analysis / scoring ---------------------------------------
-    # candidates and records are index-aligned (collect_many preserves the
-    # input handles list's order and length).
+    # Only filter-chain survivors are scored.
     scored_pairs: list[tuple[dict, dict]] = []
     analyzed_records: list[dict] = []
-    for candidate, record in zip(candidates, records):
+    for candidate, record in survivors:
         try:
             analyzed = analyzer.analyze(record, candidate["niche"])
         except Exception as exc:  # noqa: BLE001 - one bad record must not stop the others
@@ -218,7 +282,7 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
         scored_pairs.append((candidate, analyzed))
         analyzed_records.append(analyzed)
     print(f"[orchestrator] Step 5/6: scored {len(analyzed_records)} record(s) "
-          f"({len(records) - len(analyzed_records)} skipped due to analysis errors).")
+          f"({len(survivors) - len(analyzed_records)} skipped due to analysis errors).")
 
     # ---- Step 6: write CSV (always real, even in dry-run) ------------------
     csv_path: str | None = None
@@ -244,6 +308,16 @@ def run(run_name: str | None = None, dry_run: bool = False) -> dict:
             )
             logger.info("send_daily_email_report(%s) returned %s", determined_run, sent)
             print(f"[orchestrator] Step 6b: send_daily_email_report() returned {sent}.")
+
+            # Only update the persistent dedup history once the email is
+            # CONFIRMED sent (sent is True). Deliberate reading of the spec:
+            # an account whose report never arrived (sent is False) must not
+            # be marked "already sent" -- it should still be eligible to be
+            # reported next run instead of silently suppressed forever.
+            if sent:
+                dedup.update_sent_history(
+                    sent_history, analyzed_records, determined_run, scheduler_rules.now_ist().date()
+                )
         except Exception as exc:  # noqa: BLE001 - failure isolation, per Architecture.md §6
             logger.exception("notifier.send_daily_email_report failed unexpectedly.")
             errors.append(f"notification failed: {exc}")

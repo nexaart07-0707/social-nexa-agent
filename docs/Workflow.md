@@ -91,7 +91,7 @@ behaviorally distinct — see below).
   Instagram calls against the confirmed test city, or a controlled subset)
   before declaring the project done.
 - Project-level DoD (from PRD.md): full pipeline runs without crashing,
-  produces a correctly structured CSV, sends a completion Telegram
+  produces a correctly structured CSV, sends a completion email
   notification, and every `unavailable`/`needs_manual_review` field from
   the run is visible in the log and/or notification.
 
