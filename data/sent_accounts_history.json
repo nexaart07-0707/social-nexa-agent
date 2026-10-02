@@ -1,4 +1,8 @@
 {
+  "abcoffee": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
   "anandnagarroad": {
     "first_sent_date": "2026-10-01",
     "run": "run1"
@@ -11,13 +15,37 @@
     "first_sent_date": "2026-10-01",
     "run": "run1"
   },
+  "cafeinstaa": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
+  "cafeterraceatnight": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
+  "chaayos": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
   "finebakery": {
     "first_sent_date": "2026-10-01",
     "run": "run1"
   },
+  "juicecenter": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
   "kamat": {
     "first_sent_date": "2026-10-01",
     "run": "run1"
+  },
+  "maniscafe": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
+  "mylittleteapot": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
   },
   "nandhinimilkparlour": {
     "first_sent_date": "2026-10-01",
@@ -26,6 +54,14 @@
   "paibakery": {
     "first_sent_date": "2026-10-01",
     "run": "run1"
+  },
+  "pinkystore": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
+  "pondicherycafesofitelhotel": {
+    "first_sent_date": "2026-10-02",
+    "run": "run2"
   },
   "sevenbeans": {
     "first_sent_date": "2026-10-01",
