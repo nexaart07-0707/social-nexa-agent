@@ -15,8 +15,16 @@
     "first_sent_date": "2026-10-01",
     "run": "run1"
   },
+  "cafeccino": {
+    "first_sent_date": "2026-10-16",
+    "run": "run2"
+  },
   "cafeinstaa": {
     "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
+  "cafemontana": {
+    "first_sent_date": "2026-10-16",
     "run": "run2"
   },
   "cafeterraceatnight": {
@@ -30,6 +38,10 @@
   "finebakery": {
     "first_sent_date": "2026-10-01",
     "run": "run1"
+  },
+  "gulshancafe": {
+    "first_sent_date": "2026-10-16",
+    "run": "run2"
   },
   "juicecenter": {
     "first_sent_date": "2026-10-02",
@@ -61,6 +73,10 @@
   },
   "pondicherycafesofitelhotel": {
     "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
+  "radhakrushma": {
+    "first_sent_date": "2026-10-16",
     "run": "run2"
   },
   "renukarestaurant": {
