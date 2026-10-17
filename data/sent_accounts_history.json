@@ -35,12 +35,20 @@
     "first_sent_date": "2026-10-02",
     "run": "run2"
   },
+  "costa": {
+    "first_sent_date": "2026-10-17",
+    "run": "run2"
+  },
   "finebakery": {
     "first_sent_date": "2026-10-01",
     "run": "run1"
   },
   "gulshancafe": {
     "first_sent_date": "2026-10-16",
+    "run": "run2"
+  },
+  "iranicafe": {
+    "first_sent_date": "2026-10-17",
     "run": "run2"
   },
   "juicecenter": {
@@ -73,6 +81,10 @@
   },
   "pondicherycafesofitelhotel": {
     "first_sent_date": "2026-10-02",
+    "run": "run2"
+  },
+  "privatevehiclelane": {
+    "first_sent_date": "2026-10-17",
     "run": "run2"
   },
   "radhakrushma": {
