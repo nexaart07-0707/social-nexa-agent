@@ -111,6 +111,10 @@
     "first_sent_date": "2026-10-01",
     "run": "run1"
   },
+  "thecakehouse": {
+    "first_sent_date": "2026-11-23",
+    "run": "run2"
+  },
   "thecuecafe": {
     "first_sent_date": "2026-10-01",
     "run": "run1"
